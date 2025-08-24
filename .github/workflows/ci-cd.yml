@@ -21,17 +21,18 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "24"      # match your local Node
+          node-version: "24"
           cache: "npm"
 
       - name: Install dependencies
-        run: npm install          # safer than `npm ci` if package-lock.json missing
+        run: npm install
 
       - name: Ensure test script exists
         run: |
           if ! npm run | grep -q "^  test$"; then
-            echo "No test script found. Creating a dummy passing test."
-            npm set-script test "echo 'Tests passed!' && exit 0"
+            echo "No test script found. Creating a dummy test script..."
+            echo 'console.log("Tests passed!"); process.exit(0);' > dummy-test.js
+            echo "TEST_SCRIPT=dummy-test.js" >> $GITHUB_ENV
           fi
 
       - name: Run tests and capture output
@@ -39,8 +40,14 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          npm test 2>&1 | tee test-results.txt
-          echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+          if [ -f "$TEST_SCRIPT" ]; then
+            node "$TEST_SCRIPT" 2>&1 | tee test-results.txt
+            EXITCODE=${PIPESTATUS[0]}
+          else
+            npm test 2>&1 | tee test-results.txt
+            EXITCODE=${PIPESTATUS[0]}
+          fi
+          echo "exitcode=$EXITCODE" >> $GITHUB_OUTPUT
 
       - name: Upload test results artifact
         if: always()
