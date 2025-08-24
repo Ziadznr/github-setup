@@ -1,0 +1,121 @@
+name: CI/CD for Node App
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test & Publish Artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Capture test output to a file and still fail the job if tests fail.
+      - name: Run tests and capture output
+        id: test
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test-results.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      - name: Upload test results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail if tests failed
+        if: steps.test.outputs.exitcode != '0'
+        run: |
+          echo "Tests failed with exit code ${{ steps.test.outputs.exitcode }}."
+          exit 1
+
+  deploy:
+    name: Download Artifact & Deploy (Self-hosted)
+    needs: test
+    if: needs.test.result == 'success'
+    runs-on: [ self-hosted, linux, nodejs ]   # <- your runner labels
+
+    env:
+      APP_NAME: ostad-app
+      NODE_ENV: production
+      PORT: 3000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download test results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: ./ci-artifacts
+
+      - name: Show artifact content
+        run: |
+          echo "===== test-results.txt ====="
+          cat ./ci-artifacts/test-results.txt || echo "No test-results.txt found"
+
+      - name: Ensure Node.js on runner (optional if preinstalled)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install PM2 if missing
+        run: |
+          if ! command -v pm2 >/dev/null 2>&1; then
+            npm i -g pm2
+          fi
+
+      - name: Install production deps
+        run: npm ci --omit=dev
+
+      - name: Build (if your app has a build step)
+        run: |
+          if npm run | grep -q "^  build$"; then
+            npm run build
+          else
+            echo "No build script found; skipping."
+          fi
+
+      - name: Deploy with PM2
+        shell: bash
+        run: |
+          # Prefer ecosystem config if present; otherwise run `npm start`
+          if [ -f pm2.ecosystem.config.cjs ] || [ -f ecosystem.config.cjs ] || [ -f ecosystem.config.js ]; then
+            FILE=$( [ -f pm2.ecosystem.config.cjs ] && echo pm2.ecosystem.config.cjs || ( [ -f ecosystem.config.cjs ] && echo ecosystem.config.cjs || echo ecosystem.config.js ) )
+            pm2 startOrReload "$FILE" --only "$APP_NAME" || pm2 start "$FILE" --only "$APP_NAME"
+          else
+            # Fallback: launch using npm start under a fixed process name
+            pm2 describe "$APP_NAME" >/dev/null || pm2 start npm --name "$APP_NAME" -- start
+            pm2 restart "$APP_NAME"
+          fi
+          pm2 save
+
+      - name: Health check
+        shell: bash
+        continue-on-error: true
+        run: |
+          echo "Attempting HTTP health check on http://localhost:${PORT} ..."
+          curl -fsS "http://localhost:${PORT}" | head -c 300 || true
